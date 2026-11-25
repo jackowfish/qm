@@ -1,4 +1,4 @@
-import { desktopTurnId, serveDesktopRun, webClientSurface } from "./desktop-computer.ts";
+import { desktopTurnId, webClientSurface } from "./desktop-computer.ts";
 import { CLIENT_SURFACE_HEADER } from "../../chassis/src/client-surface.ts";
 import { reportHandledError, reportRequestTiming, stopBrowserErrors } from "./browser-errors.ts";
 import { captureMessage, stopAnalytics } from "./product-analytics.ts";
@@ -553,6 +553,7 @@ export interface PendingApproval {
   grantModes?: { session: boolean; always: boolean };
   blocksInput?: boolean;
   executesOnApprove?: boolean;
+  call?: { tool: string; input: Record<string, unknown> };
 }
 
 export function approvalDecidableDuringRun(approval: PendingApproval): boolean {
@@ -579,6 +580,7 @@ export type AssistantWork = AssistantMessage & {
   viaTitle?: string;
   viaId?: string;
   personaId?: string;
+  supersedes?: number;
 };
 
 function tagPersona(item: Item, turnRows: AgentMessage[]): void {
@@ -625,6 +627,7 @@ export interface TurnOptions {
   scopeId?: string | null;
   channelName?: string | null;
   ephemeral?: boolean;
+  declinePendingApprovals?: boolean;
 }
 
 export async function deleteEphemeralSession(threadRef: string, keepalive = false): Promise<void> {
@@ -993,14 +996,6 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     const msg = details?.message ?? details?.reason ?? details?.error ?? `HTTP ${r.status}`;
     throw new ApiError(msg, r.status, body);
   }
-  if (path === "/api/turn" && typeof init?.body === "string") {
-    const request = JSON.parse(init.body) as { desktopClientId?: string };
-    const response = body as { runId?: string } | null;
-    if (request.desktopClientId && response?.runId)
-      void serveDesktopRun(response.runId, request.desktopClientId, withBase, api).catch((error) =>
-        reportHandledError("desktop-computer", error),
-      );
-  }
   return body as T;
 }
 
@@ -1135,7 +1130,7 @@ export async function activeRunForThread(threadRef: string): Promise<ActiveRun> 
   return { ...live, queued: r.queued ?? [] };
 }
 
-export const PENDING_APPROVAL_REASON = "Approve or deny the pending command to continue.";
+export const PENDING_APPROVAL_REASON = "Approve or decline the pending call to continue.";
 
 export async function queueTurn(
   threadRef: string,
@@ -1201,9 +1196,12 @@ export interface LocatedRun {
   run: RunPoll;
 }
 
-export async function resolveApproval(decision: ApprovalDecision): Promise<string | null> {
+export type ApprovalSubmission =
+  { status: "gone" } | { status: "settled" } | { status: "queued" } | { status: "resumed"; runId: string };
+
+export async function resolveApproval(decision: ApprovalDecision): Promise<ApprovalSubmission> {
   if (decision.requestId.startsWith("keychain:")) {
-    if (resolvedCredentialApprovals.has(decision.requestId)) return "";
+    if (resolvedCredentialApprovals.has(decision.requestId)) return { status: "settled" };
     const id = decision.requestId.slice("keychain:".length);
     let choice = "deny";
     if (decision.approved) choice = decision.scope === "always" ? "standing" : "once";
@@ -1214,9 +1212,9 @@ export async function resolveApproval(decision: ApprovalDecision): Promise<strin
     if (!["approved", "declined", "expired"].includes(result.ask?.status))
       throw new Error("The credential request is still pending. Please try again.");
     resolvedCredentialApprovals.add(decision.requestId);
-    return "";
+    return { status: "settled" };
   }
-  const submit = await api<{ runId?: string; steered?: boolean }>(
+  const submit = await api<{ status?: string; runId?: string; steered?: boolean }>(
     `/api/approvals/${encodeURIComponent(decision.requestId)}`,
     {
       method: "POST",
@@ -1226,10 +1224,11 @@ export async function resolveApproval(decision: ApprovalDecision): Promise<strin
     if (err instanceof ApiError && err.status === 404) return null;
     throw err;
   });
-  if (!submit) return null;
+  if (!submit) return { status: "gone" };
+  if (!submit.runId && submit.status === "queued") return { status: "queued" };
   if (!submit.runId) throw new Error("Could not continue after the approval.");
   if (submit.steered) decidedDuringRunApprovals.add(decision.requestId);
-  return submit.runId;
+  return { status: "resumed", runId: submit.runId };
 }
 
 export async function runApprovalTurn(
@@ -1351,6 +1350,7 @@ function turnRequestBody(
     ...(turnOptions.scopeId ? { scopeId: turnOptions.scopeId } : {}),
     ...(turnOptions.channelName ? { channelName: turnOptions.channelName } : {}),
     ...(turnOptions.ephemeral ? { ephemeral: true } : {}),
+    ...(turnOptions.declinePendingApprovals ? { declinePendingApprovals: true } : {}),
     ...(attachments.length ? { attachments } : {}),
     ...(idempotencyKey ? { idempotencyKey } : {}),
   };
@@ -1703,7 +1703,7 @@ function applyRun(
   }
   if (approvalDenied) {
     (partial as AssistantWork & { approvalDecision?: "denied" }).approvalDecision = "denied";
-    finish(stream, partial, st, "Denied.");
+    finish(stream, partial, st, "Declined.");
     return "terminal";
   }
   if (!paused && !quiet && (run.status === "failed" || (res && res.status !== "ok"))) {
@@ -1754,12 +1754,15 @@ export async function pollRun(
   }
 }
 
+import type { ReplyNotice } from "./notifications";
+
 export interface SessionStateEvent {
   threadRef: string;
   sessionId?: string;
-  state: "working" | "awaiting_approval" | "idle" | "metadata" | "ui";
+  state: "working" | "awaiting_approval" | "idle" | "metadata" | "ui" | "notify";
   at: number;
   ui?: unknown;
+  notice?: ReplyNotice;
 }
 
 export interface InboxItemEvent {
@@ -2092,12 +2095,16 @@ export interface HistoryApprovalDecision {
   command: string;
   scope?: string;
   declined?: string;
+  purpose?: string;
+  summary?: string;
+  call?: { tool: string; input: Record<string, unknown> };
   timestamp: number;
 }
 
 function approvalDecisionMessage(item: Item): HistoryApprovalDecision | null {
   if (item.kind !== "ElicitationResponse") return null;
-  const { command, scope, declined } = item.body;
+  const { command, scope, declined, purpose, summary } = item.body;
+  const call = item.body.call as { tool?: unknown; input?: unknown } | undefined;
   if (typeof item.approved !== "boolean" || typeof command !== "string") return null;
   return {
     role: "approval-decision",
@@ -2107,6 +2114,11 @@ function approvalDecisionMessage(item: Item): HistoryApprovalDecision | null {
     requestId: item.elicitId,
     ...(typeof scope === "string" ? { scope } : {}),
     ...(typeof declined === "string" ? { declined } : {}),
+    ...(typeof purpose === "string" ? { purpose } : {}),
+    ...(typeof summary === "string" ? { summary } : {}),
+    ...(typeof call?.tool === "string" && call.input && typeof call.input === "object" && !Array.isArray(call.input)
+      ? { call: { tool: call.tool, input: call.input as Record<string, unknown> } }
+      : {}),
     timestamp: item.createdAt,
   };
 }
@@ -2434,6 +2446,7 @@ export function itemsToMessages(items: Item[], model?: Model<Api>): AgentMessage
         ...(typeof workFinishedAt === "number" ? { finishedAt: workFinishedAt } : {}),
       };
       const stopped = e.body.stopped === true;
+      const before = out.length;
       if (typeof e.body.via === "string" && text.trim()) {
         spillHeldPosts();
         flushWork("", e.createdAt);
@@ -2452,6 +2465,8 @@ export function itemsToMessages(items: Item[], model?: Model<Api>): AgentMessage
         }
       }
       tagPersona(e, out.slice(turn.start));
+      if (typeof e.body.supersedes === "number" && out.length > before)
+        (out.at(-1) as AssistantWork).supersedes = e.body.supersedes;
       posted = false;
     } else if (e.kind === "AgentMessage" && e.variant === "files_delivered") {
       appendDeliveryFiles(deliveredFilesFromAttachments(e.body.files as UserAttachment[] | undefined));

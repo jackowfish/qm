@@ -10,6 +10,8 @@ Only models listed by both endpoints, marked as chat models with tool support, a
 
 Availability refreshes on demand every five minutes and before inference when expired. Successful refreshes replace the catalog, including an empty catalog. After discovery has succeeded, a failed refresh disables gateway routes until recovery without interrupting independent direct providers, with retries after thirty seconds. In-flight requests are not cancelled; the gateway still enforces its key permissions on every call. Retired selections remain in conversation history but cannot issue a new request through a different provider.
 
+Each model id has one route. `gateway/<provider>/<model>` ids always use the gateway, and `custom/<provider>/<model>` ids use that custom provider's key. A plain id such as `claude-opus-5-5` that the gateway maps uses the gateway until an admin saves the organization's own key for that provider (Anthropic, OpenAI or OpenRouter), then it uses that key; memory embeddings follow the same rule. Saving the key also moves the organization's base model and its fallback, cron, subagent and app-edit models off the gateway when they still use it, to that provider's default model. The admin sees what moved. Moving back is an admin choice: pick a gateway model as the default again. Turns on a personal AI account don't give sandbox code gateway access. Deployment environment keys do not change routing.
+
 `MODEL_GATEWAY_MODELS` is optional and accepts the existing `local-id=upstream-id` pairs. These provide compatibility aliases using QM's existing native model definitions; they do not limit discovered models. After discovery succeeds, aliases are usable only while their upstream IDs remain advertised. Gateways without the discovery endpoints can continue to use explicit mappings. Before the first successful discovery, failures leave those configured routes available. This compatibility fallback never restores a route removed by a successful discovery.
 
 For LiteLLM deployments, allow the two authenticated GET endpoints alongside inference paths. Do not expose administrative `/model/info` or key-management routes to enable discovery. Gateways implementing only the OpenAI model-list endpoint can use explicit mappings or implement the metadata contract below.
@@ -55,7 +57,7 @@ credentials or falls back to them on account or gateway errors.
 Code the agent runs in its sandbox reaches the company's models through core instead of holding a provider key.
 Internal turns outside strict posture get `MODEL_GATEWAY_URL`, which points at core's `/v1/sandbox-model` prefix, and
 `MODEL_GATEWAY_TOKEN`, a capability token bound to the turn's actor and conversation scope that expires with the turn's
-other sandbox tokens. The agent is told both are set. Scheduled and other unattended turns get them too, without a
+other sandbox tokens. The agent is told both are set. Scheduled and other background turns get them too, without a
 grant: the token authorizes model inference and nothing else. Strict posture issues neither. No provider or gateway
 key enters the sandbox.
 
